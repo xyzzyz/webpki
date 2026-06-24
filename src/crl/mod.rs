@@ -84,6 +84,9 @@ impl<'a> RevocationOptionsBuilder<'a> {
     }
 
     /// Customize whether the CRL nextUpdate field (i.e. expiration) is enforced.
+    ///
+    /// This only controls CRL expiration. Certificate expiration is configured separately with
+    /// [`PathBuilder::with_certificate_expiration_policy`][crate::PathBuilder::with_certificate_expiration_policy].
     pub fn with_expiration_policy(mut self, policy: ExpirationPolicy) -> Self {
         self.expiration_policy = policy;
         self
@@ -261,13 +264,18 @@ pub enum UnknownStatusPolicy {
     Deny,
 }
 
-/// Describes how to handle the nextUpdate field of the CRL (i.e. expiration).
+/// Describes how expiration checks are handled.
+///
+/// When used with [`PathBuilder`][crate::PathBuilder], this controls whether certificate
+/// `notAfter` is enforced. When used with [`RevocationOptionsBuilder`], this controls whether CRL
+/// `nextUpdate` is enforced.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ExpirationPolicy {
-    /// Enforce the verification time is before the time in the nextUpdate field.
-    /// Treats an expired CRL as an error condition yielding [Error::CrlExpired].
+    /// Enforce expiration.
+    ///
+    /// Expired certificates yield [Error::CertExpired]. Expired CRLs yield [Error::CrlExpired].
     Enforce,
-    /// Ignore the CRL nextUpdate field.
+    /// Ignore expiration.
     Ignore,
 }
 

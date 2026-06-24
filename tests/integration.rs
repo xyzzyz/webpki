@@ -17,9 +17,14 @@ use core::slice;
 use core::time::Duration;
 
 use pki_types::{CertificateDer, UnixTime};
+#[cfg(feature = "alloc")]
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    date_time_ymd,
+};
 use rustls_aws_lc_rs::ALL_VERIFICATION_ALGS;
 use webpki::sct::LogIdAndTimestamp;
-use webpki::{ExtendedKeyUsage, PathBuilder, anchor_from_trusted_cert};
+use webpki::{ExpirationPolicy, ExtendedKeyUsage, PathBuilder, anchor_from_trusted_cert};
 
 /* Checks we can verify netflix's cert chain.  This is notable
  * because they're rooted at a Verisign v1 root. */
@@ -421,6 +426,171 @@ fn cert_time_validity() {
             not_after
         })
     );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn ignored_expiration_accepts_expired_end_entity() {
+    let root = make_self_signed_issuer("Root");
+    let root_der = root.der().clone();
+    let ee = make_end_entity_with_validity(&root, 2020, 2021);
+    let anchors = [anchor_from_trusted_cert(&root_der).unwrap()];
+    let time = expiration_test_time();
+    let cert = webpki::EndEntityCert::try_from(&ee).unwrap();
+    let builder = PathBuilder::new(
+        &[],
+        None,
+        &ExtendedKeyUsage::SERVER_AUTH,
+        ALL_VERIFICATION_ALGS,
+        &anchors,
+    );
+
+    assert!(matches!(
+        builder.build(&cert, time),
+        Err(webpki::Error::CertExpired { .. })
+    ));
+
+    assert!(
+        builder
+            .with_certificate_expiration_policy(ExpirationPolicy::Ignore)
+            .build(&cert, time)
+            .is_ok()
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn ignored_expiration_accepts_expired_intermediate() {
+    let root = make_self_signed_issuer("Root");
+    let root_der = root.der().clone();
+    let intermediate = make_intermediate_with_validity(&root, 2020, 2021);
+    let intermediates = [intermediate.der().clone()];
+    let ee = make_end_entity_with_validity(&intermediate, 2020, 2030);
+    let anchors = [anchor_from_trusted_cert(&root_der).unwrap()];
+    let time = expiration_test_time();
+    let cert = webpki::EndEntityCert::try_from(&ee).unwrap();
+    let builder = PathBuilder::new(
+        &intermediates,
+        None,
+        &ExtendedKeyUsage::SERVER_AUTH,
+        ALL_VERIFICATION_ALGS,
+        &anchors,
+    );
+
+    assert!(matches!(
+        builder.build(&cert, time),
+        Err(webpki::Error::CertExpired { .. })
+    ));
+
+    assert!(
+        builder
+            .with_certificate_expiration_policy(ExpirationPolicy::Ignore)
+            .build(&cert, time)
+            .is_ok()
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn ignored_expiration_still_rejects_not_yet_valid_certificates() {
+    let root = make_self_signed_issuer("Root");
+    let root_der = root.der().clone();
+    let ee = make_end_entity_with_validity(&root, 2028, 2030);
+    let anchors = [anchor_from_trusted_cert(&root_der).unwrap()];
+    let time = expiration_test_time();
+    let cert = webpki::EndEntityCert::try_from(&ee).unwrap();
+    let builder = PathBuilder::new(
+        &[],
+        None,
+        &ExtendedKeyUsage::SERVER_AUTH,
+        ALL_VERIFICATION_ALGS,
+        &anchors,
+    )
+    .with_certificate_expiration_policy(ExpirationPolicy::Ignore);
+
+    assert!(matches!(
+        builder.build(&cert, time),
+        Err(webpki::Error::CertNotValidYet { .. })
+    ));
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn ignored_expiration_still_rejects_invalid_validity_periods() {
+    let root = make_self_signed_issuer("Root");
+    let root_der = root.der().clone();
+    let ee = make_end_entity_with_validity(&root, 2028, 2021);
+    let anchors = [anchor_from_trusted_cert(&root_der).unwrap()];
+    let time = expiration_test_time();
+    let cert = webpki::EndEntityCert::try_from(&ee).unwrap();
+    let builder = PathBuilder::new(
+        &[],
+        None,
+        &ExtendedKeyUsage::SERVER_AUTH,
+        ALL_VERIFICATION_ALGS,
+        &anchors,
+    )
+    .with_certificate_expiration_policy(ExpirationPolicy::Ignore);
+
+    assert_eq!(
+        builder.build(&cert, time).err(),
+        Some(webpki::Error::InvalidCertValidity)
+    );
+}
+
+#[cfg(feature = "alloc")]
+fn expiration_test_time() -> UnixTime {
+    UnixTime::since_unix_epoch(Duration::from_secs(1_767_225_600)) // 2026-01-01T00:00:00Z
+}
+
+#[cfg(feature = "alloc")]
+fn make_self_signed_issuer(org_name: &'static str) -> CertifiedIssuer<'static, KeyPair> {
+    let params = issuer_params_with_validity(org_name, 2020, 2030);
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    CertifiedIssuer::self_signed(params, key).unwrap()
+}
+
+#[cfg(feature = "alloc")]
+fn make_intermediate_with_validity(
+    issuer: &CertifiedIssuer<'_, KeyPair>,
+    not_before_year: i32,
+    not_after_year: i32,
+) -> CertifiedIssuer<'static, KeyPair> {
+    let params = issuer_params_with_validity("Intermediate", not_before_year, not_after_year);
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    CertifiedIssuer::signed_by(params, key, issuer).unwrap()
+}
+
+#[cfg(feature = "alloc")]
+fn issuer_params_with_validity(
+    org_name: &'static str,
+    not_before_year: i32,
+    not_after_year: i32,
+) -> CertificateParams {
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, org_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params.not_before = date_time_ymd(not_before_year, 1, 1);
+    params.not_after = date_time_ymd(not_after_year, 1, 1);
+    params
+}
+
+#[cfg(feature = "alloc")]
+fn make_end_entity_with_validity(
+    issuer: &CertifiedIssuer<'_, KeyPair>,
+    not_before_year: i32,
+    not_after_year: i32,
+) -> CertificateDer<'static> {
+    let mut params = CertificateParams::new(vec!["example.com".into()]).unwrap();
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.not_before = date_time_ymd(not_before_year, 1, 1);
+    params.not_after = date_time_ymd(not_after_year, 1, 1);
+
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    params.signed_by(&key, issuer).unwrap().der().clone()
 }
 
 #[cfg(feature = "alloc")]

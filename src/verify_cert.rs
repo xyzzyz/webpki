@@ -22,7 +22,7 @@ use pki_types::SubjectPublicKeyInfoDer;
 use pki_types::{CertificateDer, SignatureVerificationAlgorithm, TrustAnchor, UnixTime};
 
 use crate::cert::Cert;
-use crate::crl::RevocationOptions;
+use crate::crl::{ExpirationPolicy, RevocationOptions};
 use crate::der::{self, FromDer};
 use crate::end_entity::EndEntityCert;
 use crate::error::Error;
@@ -39,6 +39,7 @@ pub struct PathBuilder<'a, 'p> {
     pub(crate) trust_anchors: &'p [TrustAnchor<'p>],
     pub(crate) intermediate_certs: &'p [CertificateDer<'p>],
     pub(crate) revocation: Option<RevocationOptions<'a>>,
+    pub(crate) certificate_expiration_policy: ExpirationPolicy,
     #[expect(clippy::type_complexity)]
     pub(crate) verify_path: Option<&'a dyn Fn(&VerifiedPath<'_>) -> Result<(), Error>>,
 }
@@ -71,8 +72,21 @@ impl<'a, 'p: 'a> PathBuilder<'a, 'p> {
             trust_anchors,
             intermediate_certs,
             revocation,
+            certificate_expiration_policy: ExpirationPolicy::Enforce,
             verify_path: None,
         }
+    }
+
+    /// Customize whether certificate `notAfter` expiration is enforced.
+    ///
+    /// By default, path building rejects expired certificates. Ignoring expiration does not
+    /// bypass certificate parsing, malformed validity periods, or `notBefore` checks.
+    ///
+    /// This only controls certificate expiration. CRL expiration is configured separately with
+    /// [`RevocationOptionsBuilder::with_expiration_policy`][crate::RevocationOptionsBuilder::with_expiration_policy].
+    pub fn with_certificate_expiration_policy(mut self, policy: ExpirationPolicy) -> Self {
+        self.certificate_expiration_policy = policy;
+        self
     }
 
     /// Set a path verification function to use for path building.
@@ -117,7 +131,14 @@ impl<'a, 'p: 'a> PathBuilder<'a, 'p> {
     ) -> Result<&'p TrustAnchor<'p>, ControlFlow<Error, Error>> {
         let role = path.node().role();
 
-        check_issuer_independent_properties(path.head(), time, role, sub_ca_count, self.eku)?;
+        check_issuer_independent_properties(
+            path.head(),
+            time,
+            role,
+            sub_ca_count,
+            self.eku,
+            self.certificate_expiration_policy,
+        )?;
 
         // TODO: HPKP checks.
 
@@ -410,6 +431,7 @@ fn check_issuer_independent_properties(
     role: Role,
     sub_ca_count: usize,
     eku: &dyn ExtendedKeyUsageValidator,
+    expiration_policy: ExpirationPolicy,
 ) -> Result<(), Error> {
     // TODO: check_distrust(trust_anchor_subject, trust_anchor_spki)?;
     // TODO: Check signature algorithm like mozilla::pkix.
@@ -422,8 +444,9 @@ fn check_issuer_independent_properties(
     // though it would be kind of nice to ensure that a KeyUsage without
     // the keyEncipherment bit could not be used for RSA key exchange.
 
-    cert.validity
-        .read_all(Error::BadDer, |value| check_validity(value, time))?;
+    cert.validity.read_all(Error::BadDer, |value| {
+        check_validity(value, time, expiration_policy)
+    })?;
     untrusted::read_all_optional(cert.basic_constraints, Error::BadDer, |value| {
         check_basic_constraints(value, role, sub_ca_count)
     })?;
@@ -478,7 +501,11 @@ fn check_eku(
 }
 
 // https://www.rfc-editor.org/info/rfc5280/#section-4.1.2.5
-fn check_validity(input: &mut untrusted::Reader<'_>, time: UnixTime) -> Result<(), Error> {
+fn check_validity(
+    input: &mut untrusted::Reader<'_>,
+    time: UnixTime,
+    expiration_policy: ExpirationPolicy,
+) -> Result<(), Error> {
     let not_before = UnixTime::from_der(input)?;
     let not_after = UnixTime::from_der(input)?;
 
@@ -488,7 +515,7 @@ fn check_validity(input: &mut untrusted::Reader<'_>, time: UnixTime) -> Result<(
     if time < not_before {
         return Err(Error::CertNotValidYet { time, not_before });
     }
-    if time > not_after {
+    if expiration_policy == ExpirationPolicy::Enforce && time > not_after {
         return Err(Error::CertExpired { time, not_after });
     }
 
